@@ -1,3 +1,6 @@
+> [!IMPORTANT]
+> This is a fork of Zed with a basic RTL-language support. Only tested with Hebrew and on macOS. Don't expect a lot. The patch lives in the `bidi-support` branch.
+
 # Zed
 
 [![Zed](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/zed-industries/zed/main/assets/badge/v0.json)](https://zed.dev)

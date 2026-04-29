@@ -4,9 +4,9 @@ use collections::HashMap;
 use core_foundation::{
     array::{CFArray, CFArrayRef},
     attributed_string::CFMutableAttributedString,
-    base::{CFRange, TCFType},
+    base::{CFIndex, CFRange, TCFType},
     number::CFNumber,
-    string::CFString,
+    string::{CFString, CFStringRef},
 };
 use core_graphics::{
     base::{CGGlyph, kCGImageAlphaPremultipliedLast},
@@ -21,7 +21,7 @@ use core_text::{
         CTFontDescriptor, kCTFontSlantTrait, kCTFontSymbolicTrait, kCTFontWeightTrait,
         kCTFontWidthTrait,
     },
-    line::CTLine,
+    line::{CTLine, CTLineRef},
     string_attributes::kCTFontAttributeName,
 };
 use font_kit::{
@@ -34,10 +34,10 @@ use font_kit::{
     sources::mem::MemSource,
 };
 use gpui::{
-    Bounds, DevicePixels, Font, FontFallbacks, FontFeatures, FontId, FontMetrics, FontRun,
-    FontStyle, FontWeight, GlyphId, Hsla, LineLayout, Pixels, PlatformTextSystem,
-    RenderGlyphParams, Result, Rgba, SUBPIXEL_VARIANTS_X, ShapedGlyph, ShapedRun, SharedString,
-    Size, TextRenderingMode, point, px, size, swap_rgba_pa_to_bgra,
+    BidiLineLayout, Bounds, CaretOffset, DevicePixels, Font, FontFallbacks, FontFeatures, FontId,
+    FontMetrics, FontRun, FontStyle, FontWeight, GlyphId, HitTestRange, Hsla, LineLayout, Pixels,
+    PlatformTextSystem, RenderGlyphParams, Result, Rgba, SUBPIXEL_VARIANTS_X, ShapedGlyph,
+    ShapedRun, SharedString, Size, TextRenderingMode, point, px, size, swap_rgba_pa_to_bgra,
 };
 use parking_lot::{RwLock, RwLockUpgradableReadGuard};
 use pathfinder_geometry::{
@@ -49,6 +49,17 @@ use smallvec::SmallVec;
 use std::{borrow::Cow, char, convert::TryFrom, sync::Arc, sync::OnceLock};
 
 use crate::open_type::apply_features_and_fallbacks;
+
+#[link(name = "CoreText", kind = "framework")]
+unsafe extern "C" {
+    fn CTLineGetOffsetForStringIndex(
+        line: CTLineRef,
+        char_index: CFIndex,
+        secondary_offset: *mut CGFloat,
+    ) -> CGFloat;
+
+    static kCTWritingDirectionAttributeName: CFStringRef;
+}
 
 #[allow(non_upper_case_globals)]
 const kCGImageAlphaOnly: u32 = 7;
@@ -544,6 +555,7 @@ impl MacTextSystemState {
                 break_ligature = !break_ligature;
             }
         }
+        apply_ltr_interpolation_attributes(text, &mut string);
         // Retrieve the glyphs from the shaped line, converting UTF16 offsets to UTF8 offsets.
         let line = CTLine::new_with_attributed_string(string.as_concrete_TypeRef());
         let glyph_runs = line.glyph_runs();
@@ -590,15 +602,200 @@ impl MacTextSystemState {
             }
         }
         let typographic_bounds = line.get_typographic_bounds();
+        let width = typographic_bounds.width.into();
+        let bidi = bidi_layout_for_core_text_line(text, &line, width);
         LineLayout {
             runs,
             font_size,
-            width: typographic_bounds.width.into(),
+            width,
             ascent: max_ascent.into(),
             descent: max_descent.into(),
             len: text.len(),
+            bidi,
         }
     }
+}
+
+fn bidi_layout_for_core_text_line(
+    text: &str,
+    line: &CTLine,
+    width: Pixels,
+) -> Option<BidiLineLayout> {
+    if text.is_empty() {
+        return None;
+    }
+
+    let utf16_boundaries = utf8_utf16_boundaries(text);
+    let mut caret_offsets = Vec::with_capacity(utf16_boundaries.len());
+    for (utf8_index, utf16_index) in &utf16_boundaries {
+        let mut secondary_offset = 0.0;
+        let primary_offset = unsafe {
+            CTLineGetOffsetForStringIndex(
+                line.as_concrete_TypeRef(),
+                *utf16_index,
+                &mut secondary_offset,
+            )
+        };
+        let primary_x = px(primary_offset as f32);
+        let secondary_x = if (secondary_offset - primary_offset).abs() > 0.01 {
+            Some(px(secondary_offset as f32))
+        } else {
+            None
+        };
+        caret_offsets.push(CaretOffset {
+            index: *utf8_index,
+            primary_x,
+            secondary_x,
+        });
+    }
+
+    let mut x_boundaries = vec![Pixels::ZERO, width];
+    for caret in &caret_offsets {
+        x_boundaries.push(clamp_pixels(caret.primary_x, Pixels::ZERO, width));
+        if let Some(secondary_x) = caret.secondary_x {
+            x_boundaries.push(clamp_pixels(secondary_x, Pixels::ZERO, width));
+        }
+    }
+    x_boundaries.sort_by(|left, right| {
+        f32::from(*left)
+            .partial_cmp(&f32::from(*right))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    x_boundaries.dedup_by(|left, right| (f32::from(*left) - f32::from(*right)).abs() < 0.01);
+
+    let mut hit_test_ranges = Vec::new();
+    for pair in x_boundaries.windows(2) {
+        let start_x = pair[0];
+        let end_x = pair[1];
+        if end_x <= start_x {
+            continue;
+        }
+
+        let sample_x = start_x + (end_x - start_x) / 2.;
+        let utf16_index =
+            line.get_string_index_for_position(CGPoint::new(f32::from(sample_x) as CGFloat, 0.0));
+        if utf16_index < 0 {
+            continue;
+        }
+        let index = utf8_index_for_utf16_index(text, utf16_index as usize);
+        hit_test_ranges.push(HitTestRange {
+            start_x,
+            end_x,
+            index,
+        });
+    }
+
+    Some(BidiLineLayout {
+        caret_offsets,
+        hit_test_ranges,
+    })
+}
+
+fn clamp_pixels(value: Pixels, min: Pixels, max: Pixels) -> Pixels {
+    if value < min {
+        min
+    } else if value > max {
+        max
+    } else {
+        value
+    }
+}
+
+fn utf8_utf16_boundaries(text: &str) -> Vec<(usize, CFIndex)> {
+    let mut boundaries = Vec::with_capacity(text.len() + 1);
+    let mut utf16_index = 0usize;
+    boundaries.push((0, 0));
+    for (utf8_index, character) in text.char_indices() {
+        utf16_index += character.len_utf16();
+        boundaries.push((utf8_index + character.len_utf8(), utf16_index as CFIndex));
+    }
+    boundaries
+}
+
+fn utf8_index_for_utf16_index(text: &str, target_utf16_index: usize) -> usize {
+    let mut utf16_index = 0usize;
+    for (utf8_index, character) in text.char_indices() {
+        if utf16_index >= target_utf16_index {
+            return utf8_index;
+        }
+        utf16_index += character.len_utf16();
+    }
+    text.len()
+}
+
+fn apply_ltr_interpolation_attributes(text: &str, string: &mut CFMutableAttributedString) {
+    let ranges = interpolation_like_ranges(text);
+    if ranges.is_empty() {
+        return;
+    }
+
+    let ltr_override = CFArray::from_CFTypes(&[CFNumber::from(2)]);
+    let utf16_boundaries = utf8_utf16_boundaries(text);
+
+    for range in ranges {
+        let Some((_, utf16_start)) = utf16_boundaries
+            .iter()
+            .find(|(utf8_index, _)| *utf8_index == range.start)
+        else {
+            continue;
+        };
+        let Some((_, utf16_end)) = utf16_boundaries
+            .iter()
+            .find(|(utf8_index, _)| *utf8_index == range.end)
+        else {
+            continue;
+        };
+
+        unsafe {
+            string.set_attribute(
+                CFRange::init(*utf16_start, *utf16_end - *utf16_start),
+                kCTWritingDirectionAttributeName,
+                &ltr_override,
+            );
+        }
+    }
+}
+
+fn interpolation_like_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut offset = 0;
+
+    while let Some(relative_start) = text[offset..].find("${") {
+        let start = offset + relative_start;
+        let mut depth = 1usize;
+        let mut is_ascii_expression = true;
+        let mut end = None;
+
+        for (relative_index, character) in text[start + "${".len()..].char_indices() {
+            if !character.is_ascii() || character == '\n' || character == '\r' {
+                is_ascii_expression = false;
+                break;
+            }
+
+            match character {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(start + "${".len() + relative_index + character.len_utf8());
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(end) = end {
+            if is_ascii_expression {
+                ranges.push(start..end);
+            }
+            offset = end;
+        } else {
+            break;
+        }
+    }
+
+    ranges
 }
 
 #[derive(Debug, Clone)]
@@ -739,8 +936,19 @@ mod lenient_font_attributes {
 
 #[cfg(test)]
 mod tests {
+    use super::interpolation_like_ranges;
     use crate::MacTextSystem;
-    use gpui::{FontRun, GlyphId, PlatformTextSystem, font, px};
+    use gpui::{FontRun, GlyphId, LineLayout, PlatformTextSystem, font, px};
+
+    fn glyph_x_for_index(layout: &LineLayout, index: usize) -> f32 {
+        layout
+            .runs
+            .iter()
+            .flat_map(|run| run.glyphs.iter())
+            .find(|glyph| glyph.index == index)
+            .map(|glyph| f32::from(glyph.position.x))
+            .unwrap()
+    }
 
     #[test]
     fn test_layout_line_bom_char() {
@@ -873,5 +1081,53 @@ mod tests {
         let layout = fonts.layout_line(text, px(16.), font_runs);
         assert_eq!(layout.len, 0);
         assert!(layout.runs.is_empty());
+    }
+
+    #[test]
+    fn test_interpolation_like_ranges_cover_ascii_expressions() {
+        let text = "שלום ${name} ${foo + bar({ baz: 1 })} ${עברית}";
+
+        let ranges = interpolation_like_ranges(text);
+
+        assert_eq!(
+            ranges
+                .iter()
+                .map(|range| &text[range.clone()])
+                .collect::<Vec<_>>(),
+            vec!["${name}", "${foo + bar({ baz: 1 })}"]
+        );
+    }
+
+    #[test]
+    fn test_template_interpolation_is_ltr_inside_hebrew_text() {
+        let fonts = MacTextSystem::new();
+        let font_id = fonts.font_id(&font("Helvetica")).unwrap();
+
+        let text = "`שלום ${name} עולם`";
+        let layout = fonts.layout_line(
+            text,
+            px(16.),
+            &[FontRun {
+                font_id,
+                len: text.len(),
+            }],
+        );
+
+        assert_eq!(layout.len, text.len());
+        assert!(layout.bidi.is_some());
+
+        let interpolation = "${name}";
+        let interpolation_start = text.find(interpolation).unwrap();
+        let interpolation_positions = interpolation
+            .char_indices()
+            .map(|(index, _)| glyph_x_for_index(&layout, interpolation_start + index))
+            .collect::<Vec<_>>();
+
+        assert!(
+            interpolation_positions
+                .windows(2)
+                .all(|pair| pair[0] < pair[1]),
+            "expected interpolation glyphs to render left-to-right, got {interpolation_positions:?}"
+        );
     }
 }

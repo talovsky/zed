@@ -1824,7 +1824,12 @@ impl EditorElement {
                     let cursor_next_x = cursor_row_layout.x_for_index(cursor_column + 1)
                         + cursor_row_layout
                             .alignment_offset(self.style.text.text_align, text_hitbox.size.width);
-                    let mut cell_width = cursor_next_x - cursor_character_x;
+                    let cursor_block_x = if cursor_next_x < cursor_character_x {
+                        cursor_next_x
+                    } else {
+                        cursor_character_x
+                    };
+                    let mut cell_width = (cursor_next_x - cursor_character_x).abs();
                     if cell_width == Pixels::ZERO {
                         cell_width = em_advance;
                     }
@@ -1893,7 +1898,13 @@ impl EditorElement {
                         }
                     }
 
-                    let x = cursor_character_x - scroll_pixel_position.x.into();
+                    let cursor_x = match selection.cursor_shape {
+                        CursorShape::Bar => cursor_character_x,
+                        CursorShape::Block | CursorShape::Hollow | CursorShape::Underline => {
+                            cursor_block_x
+                        }
+                    };
+                    let x = cursor_x - scroll_pixel_position.x.into();
                     let y = ((cursor_position.row().as_f64() - scroll_position.y)
                         * ScrollPixelOffset::from(line_height))
                     .into();
@@ -7394,60 +7405,110 @@ impl EditorElement {
                     ..cmp::min(range.end.row().next_row(), end_row)
             };
 
-            let highlighted_range = HighlightedRange {
-                color,
-                line_height: layout.position_map.line_height,
-                corner_radius,
-                start_y: layout.content_origin.y
+            let row_fragments = Self::highlighted_range_row_fragments(
+                range.clone(),
+                row_range.clone(),
+                start_row,
+                &layout.position_map.line_layouts,
+            );
+
+            let highlighted_line = |row: DisplayRow, range_end: usize, fragment: Range<Pixels>| {
+                let line_layout = &layout.position_map.line_layouts[row.minus(start_row) as usize];
+                let alignment_offset =
+                    line_layout.alignment_offset(layout.text_align, layout.content_width);
+                let start_x = layout.content_origin.x
                     + Pixels::from(
-                        (row_range.start.as_f64() - layout.position_map.scroll_position.y)
-                            * ScrollOffset::from(layout.position_map.line_height),
-                    ),
-                lines: row_range
-                    .iter_rows()
-                    .map(|row| {
-                        let line_layout =
-                            &layout.position_map.line_layouts[row.minus(start_row) as usize];
-                        let alignment_offset =
-                            line_layout.alignment_offset(layout.text_align, layout.content_width);
-                        HighlightedRangeLine {
-                            start_x: if row == range.start.row() {
-                                layout.content_origin.x
-                                    + Pixels::from(
-                                        ScrollPixelOffset::from(
-                                            line_layout.x_for_index(range.start.column() as usize)
-                                                + alignment_offset,
-                                        ) - layout.position_map.scroll_pixel_position.x,
-                                    )
-                            } else {
-                                layout.content_origin.x + alignment_offset
-                                    - Pixels::from(layout.position_map.scroll_pixel_position.x)
-                            },
-                            end_x: if row == range.end.row() {
-                                layout.content_origin.x
-                                    + Pixels::from(
-                                        ScrollPixelOffset::from(
-                                            line_layout.x_for_index(range.end.column() as usize)
-                                                + alignment_offset,
-                                        ) - layout.position_map.scroll_pixel_position.x,
-                                    )
-                            } else {
-                                Pixels::from(
-                                    ScrollPixelOffset::from(
-                                        layout.content_origin.x
-                                            + line_layout.width
-                                            + alignment_offset
-                                            + line_end_overshoot,
-                                    ) - layout.position_map.scroll_pixel_position.x,
-                                )
-                            },
-                        }
-                    })
-                    .collect(),
+                        ScrollPixelOffset::from(fragment.start + alignment_offset)
+                            - layout.position_map.scroll_pixel_position.x,
+                    );
+                let mut end_x = layout.content_origin.x
+                    + Pixels::from(
+                        ScrollPixelOffset::from(fragment.end + alignment_offset)
+                            - layout.position_map.scroll_pixel_position.x,
+                    );
+                if row != range.end.row() && range_end == line_layout.len {
+                    end_x += line_end_overshoot;
+                }
+                HighlightedRangeLine { start_x, end_x }
             };
 
-            highlighted_range.paint(fill, layout.position_map.text_hitbox.bounds, window);
+            if row_fragments
+                .iter()
+                .all(|(_, _, fragments)| fragments.len() <= 1)
+            {
+                HighlightedRange {
+                    color,
+                    line_height: layout.position_map.line_height,
+                    corner_radius,
+                    start_y: layout.content_origin.y
+                        + Pixels::from(
+                            (row_range.start.as_f64() - layout.position_map.scroll_position.y)
+                                * ScrollOffset::from(layout.position_map.line_height),
+                        ),
+                    lines: row_fragments
+                        .into_iter()
+                        .filter_map(|(row, range_end, mut fragments)| {
+                            fragments
+                                .pop()
+                                .map(|fragment| highlighted_line(row, range_end, fragment))
+                        })
+                        .collect(),
+                }
+                .paint(fill, layout.position_map.text_hitbox.bounds, window);
+            } else {
+                for (row, range_end, fragments) in row_fragments {
+                    for fragment in fragments {
+                        HighlightedRange {
+                            color,
+                            line_height: layout.position_map.line_height,
+                            corner_radius,
+                            start_y: layout.content_origin.y
+                                + Pixels::from(
+                                    (row.as_f64() - layout.position_map.scroll_position.y)
+                                        * ScrollOffset::from(layout.position_map.line_height),
+                                ),
+                            lines: vec![highlighted_line(row, range_end, fragment)],
+                        }
+                        .paint(
+                            fill,
+                            layout.position_map.text_hitbox.bounds,
+                            window,
+                        );
+                    }
+                }
+            }
         }
+    }
+
+    fn highlighted_range_row_fragments(
+        range: Range<DisplayPoint>,
+        row_range: Range<DisplayRow>,
+        start_row: DisplayRow,
+        line_layouts: &[LineWithInvisibles],
+    ) -> Vec<(DisplayRow, usize, SmallVec<[Range<Pixels>; 4]>)> {
+        row_range
+            .iter_rows()
+            .map(|row| {
+                let line_layout = &line_layouts[row.minus(start_row) as usize];
+                let range_start = if row == range.start.row() {
+                    range.start.column() as usize
+                } else {
+                    0
+                };
+                let range_end = if row == range.end.row() {
+                    range.end.column() as usize
+                } else {
+                    line_layout.len
+                };
+                let mut fragments =
+                    line_layout.selection_fragments_for_range(range_start..range_end);
+                if fragments.is_empty() && row != range.end.row() && range_end == line_layout.len {
+                    let x = line_layout.x_for_index(range_start);
+                    fragments.push(x..x);
+                }
+                (row, range_end, fragments)
+            })
+            .collect()
     }
 
     fn paint_inline_diagnostics(
@@ -9623,6 +9684,54 @@ impl LineWithInvisibles {
         }
 
         None
+    }
+
+    pub fn selection_fragments_for_range(
+        &self,
+        range: Range<usize>,
+    ) -> SmallVec<[Range<Pixels>; 4]> {
+        if range.is_empty() {
+            return SmallVec::new();
+        }
+
+        let mut fragments = SmallVec::new();
+        let mut fragment_start_x = Pixels::ZERO;
+        let mut fragment_start_index = 0;
+
+        for fragment in &self.fragments {
+            match fragment {
+                LineFragment::Text(shaped_line) => {
+                    let fragment_end_index = fragment_start_index + shaped_line.len;
+                    let start = range.start.max(fragment_start_index);
+                    let end = range.end.min(fragment_end_index);
+                    if start < end {
+                        fragments.extend(
+                            shaped_line
+                                .selection_fragments_for_range(
+                                    start - fragment_start_index..end - fragment_start_index,
+                                )
+                                .into_iter()
+                                .map(|fragment| {
+                                    fragment_start_x + fragment.start
+                                        ..fragment_start_x + fragment.end
+                                }),
+                        );
+                    }
+                    fragment_start_x += shaped_line.width;
+                    fragment_start_index = fragment_end_index;
+                }
+                LineFragment::Element { len, size, .. } => {
+                    let fragment_end_index = fragment_start_index + len;
+                    if range.start < fragment_end_index && fragment_start_index < range.end {
+                        fragments.push(fragment_start_x..fragment_start_x + size.width);
+                    }
+                    fragment_start_index = fragment_end_index;
+                    fragment_start_x += size.width;
+                }
+            }
+        }
+
+        fragments
     }
 
     pub fn font_id_for_index(&self, index: usize) -> Option<FontId> {
@@ -12863,6 +12972,44 @@ mod tests {
             snapshot: snapshot,
             row_infos: &ROW_INFOS,
         }
+    }
+
+    fn test_line_with_invisibles(text: &str, width: Pixels) -> LineWithInvisibles {
+        let len = text.len();
+        LineWithInvisibles {
+            fragments: smallvec![LineFragment::Element {
+                id: ChunkRendererId::Fold(Default::default()),
+                element: None,
+                size: size(width, px(16.)),
+                len,
+            }],
+            invisibles: Vec::new(),
+            len,
+            width,
+            font_size: px(16.),
+        }
+    }
+
+    #[test]
+    fn test_highlighted_range_row_fragments_preserve_selected_line_endings() {
+        let line_layouts = vec![
+            test_line_with_invisibles("abc", px(24.)),
+            test_line_with_invisibles("", Pixels::ZERO),
+        ];
+        let fragments = EditorElement::highlighted_range_row_fragments(
+            DisplayPoint::new(DisplayRow(0), 3)..DisplayPoint::new(DisplayRow(2), 0),
+            DisplayRow(0)..DisplayRow(2),
+            DisplayRow(0),
+            &line_layouts,
+        );
+
+        assert_eq!(fragments.len(), 2);
+        assert_eq!(fragments[0].0, DisplayRow(0));
+        assert_eq!(fragments[0].1, 3);
+        assert_eq!(fragments[0].2.as_slice(), &[px(24.)..px(24.)]);
+        assert_eq!(fragments[1].0, DisplayRow(1));
+        assert_eq!(fragments[1].1, 0);
+        assert_eq!(fragments[1].2.as_slice(), &[Pixels::ZERO..Pixels::ZERO]);
     }
 
     #[gpui::test]
