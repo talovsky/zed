@@ -26,6 +26,49 @@ pub struct LineLayout {
     pub runs: Vec<ShapedRun>,
     /// The length of the line in utf-8 bytes
     pub len: usize,
+    /// Bidi-aware caret and hit-test geometry, when provided by the platform text system.
+    pub bidi: Option<BidiLineLayout>,
+}
+
+/// Which visual caret edge to use for a logical text boundary.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CaretAffinity {
+    /// The primary caret offset reported by the text system.
+    #[default]
+    Primary,
+    /// The secondary caret offset at ambiguous bidi boundaries, when available.
+    Secondary,
+}
+
+/// A visual caret offset for a logical UTF-8 byte index.
+#[derive(Clone, Debug)]
+pub struct CaretOffset {
+    /// The logical UTF-8 byte index for this text boundary.
+    pub index: usize,
+    /// The primary visual x offset for this boundary.
+    pub primary_x: Pixels,
+    /// The secondary visual x offset for ambiguous bidi boundaries.
+    pub secondary_x: Option<Pixels>,
+}
+
+/// The logical index associated with a visual x interval.
+#[derive(Clone, Debug)]
+pub struct HitTestRange {
+    /// The inclusive visual x start of this hit-test interval.
+    pub start_x: Pixels,
+    /// The exclusive visual x end of this hit-test interval.
+    pub end_x: Pixels,
+    /// The logical UTF-8 byte index returned for points in this interval.
+    pub index: usize,
+}
+
+/// Bidi-aware geometry for a shaped line.
+#[derive(Clone, Debug, Default)]
+pub struct BidiLineLayout {
+    /// Visual caret offsets for logical UTF-8 text boundaries.
+    pub caret_offsets: Vec<CaretOffset>,
+    /// Visual x intervals mapped to logical UTF-8 byte indices.
+    pub hit_test_ranges: Vec<HitTestRange>,
 }
 
 /// A run of text that has been shaped .
@@ -56,6 +99,16 @@ pub struct ShapedGlyph {
 impl LineLayout {
     /// The index for the character at the given x coordinate
     pub fn index_for_x(&self, x: Pixels) -> Option<usize> {
+        if let Some(bidi) = &self.bidi
+            && x < self.width
+        {
+            return bidi.index_for_x(x);
+        }
+
+        self.fallback_index_for_x(x)
+    }
+
+    fn fallback_index_for_x(&self, x: Pixels) -> Option<usize> {
         if x >= self.width {
             None
         } else {
@@ -73,6 +126,16 @@ impl LineLayout {
     /// closest_index_for_x returns the character boundary closest to the given x coordinate
     /// (e.g. to handle aligning up/down arrow keys)
     pub fn closest_index_for_x(&self, x: Pixels) -> usize {
+        if let Some(bidi) = &self.bidi
+            && let Some(index) = bidi.closest_index_for_x(x)
+        {
+            return index;
+        }
+
+        self.fallback_closest_index_for_x(x)
+    }
+
+    fn fallback_closest_index_for_x(&self, x: Pixels) -> usize {
         let mut prev_index = 0;
         let mut prev_x = px(0.);
 
@@ -103,6 +166,21 @@ impl LineLayout {
 
     /// The x position of the character at the given index
     pub fn x_for_index(&self, index: usize) -> Pixels {
+        self.caret_x_for_index(index, CaretAffinity::Primary)
+    }
+
+    /// Returns the visual caret x offset for a logical UTF-8 byte index.
+    pub fn caret_x_for_index(&self, index: usize, affinity: CaretAffinity) -> Pixels {
+        if let Some(bidi) = &self.bidi
+            && let Some(x) = bidi.caret_x_for_index(index, affinity)
+        {
+            return x;
+        }
+
+        self.fallback_x_for_index(index)
+    }
+
+    fn fallback_x_for_index(&self, index: usize) -> Pixels {
         for run in &self.runs {
             for glyph in &run.glyphs {
                 if glyph.index >= index {
@@ -111,6 +189,27 @@ impl LineLayout {
             }
         }
         self.width
+    }
+
+    /// Returns normalized visual x fragments for a logical UTF-8 byte range.
+    pub fn selection_fragments_for_range(
+        &self,
+        range: Range<usize>,
+    ) -> SmallVec<[Range<Pixels>; 4]> {
+        if range.is_empty() {
+            return SmallVec::new();
+        }
+
+        if let Some(bidi) = &self.bidi {
+            let fragments = bidi.selection_fragments_for_range(range.clone(), self);
+            if !fragments.is_empty() {
+                return fragments;
+            }
+        }
+
+        smallvec::smallvec![
+            self.fallback_x_for_index(range.start)..self.fallback_x_for_index(range.end)
+        ]
     }
 
     /// The corresponding Font at the given index
@@ -204,6 +303,130 @@ impl LineLayout {
         }
 
         boundaries
+    }
+}
+
+impl BidiLineLayout {
+    /// Returns the visual caret x offset for an index when platform geometry has it.
+    pub fn caret_x_for_index(&self, index: usize, affinity: CaretAffinity) -> Option<Pixels> {
+        let caret = self
+            .caret_offsets
+            .iter()
+            .find(|caret| caret.index == index)?;
+        match affinity {
+            CaretAffinity::Primary => Some(caret.primary_x),
+            CaretAffinity::Secondary => caret.secondary_x.or(Some(caret.primary_x)),
+        }
+    }
+
+    /// Returns the logical UTF-8 byte index for a visual x offset.
+    pub fn index_for_x(&self, x: Pixels) -> Option<usize> {
+        for range in &self.hit_test_ranges {
+            if range.start_x <= x && x < range.end_x {
+                return Some(range.index);
+            }
+        }
+        self.closest_index_for_x(x)
+    }
+
+    /// Returns the logical UTF-8 byte index whose caret is closest to a visual x offset.
+    pub fn closest_index_for_x(&self, x: Pixels) -> Option<usize> {
+        self.caret_offsets
+            .iter()
+            .min_by(|left, right| {
+                (left.primary_x - x)
+                    .abs()
+                    .partial_cmp(&(right.primary_x - x).abs())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|caret| caret.index)
+    }
+
+    fn selection_fragments_for_range(
+        &self,
+        range: Range<usize>,
+        layout: &LineLayout,
+    ) -> SmallVec<[Range<Pixels>; 4]> {
+        let mut carets = Vec::new();
+        carets.push(self.caret_for_index(range.start, layout));
+        carets.extend(
+            self.caret_offsets
+                .iter()
+                .filter(|caret| range.start < caret.index && caret.index < range.end)
+                .cloned(),
+        );
+        carets.push(self.caret_for_index(range.end, layout));
+        carets.sort_by_key(|caret| caret.index);
+        carets.dedup_by_key(|caret| caret.index);
+
+        let mut fragments = SmallVec::<[Range<Pixels>; 4]>::new();
+        for pair in carets.windows(2) {
+            if let Some(fragment) = closest_visual_fragment_between(&pair[0], &pair[1]) {
+                merge_fragment(&mut fragments, fragment);
+            }
+        }
+        fragments
+    }
+
+    fn caret_for_index(&self, index: usize, layout: &LineLayout) -> CaretOffset {
+        self.caret_offsets
+            .iter()
+            .find(|caret| caret.index == index)
+            .cloned()
+            .unwrap_or_else(|| CaretOffset {
+                index,
+                primary_x: layout.caret_x_for_index(index, CaretAffinity::Primary),
+                secondary_x: None,
+            })
+    }
+}
+
+fn closest_visual_fragment_between(
+    left: &CaretOffset,
+    right: &CaretOffset,
+) -> Option<Range<Pixels>> {
+    let mut best: Option<(Pixels, Pixels, Pixels)> = None;
+    for left_x in [Some(left.primary_x), left.secondary_x]
+        .into_iter()
+        .flatten()
+    {
+        for right_x in [Some(right.primary_x), right.secondary_x]
+            .into_iter()
+            .flatten()
+        {
+            let width = (right_x - left_x).abs();
+            if width == Pixels::ZERO {
+                continue;
+            }
+
+            if best.is_none_or(|(_, _, best_width)| width < best_width) {
+                best = Some((left_x, right_x, width));
+            }
+        }
+    }
+
+    best.map(|(left_x, right_x, _)| {
+        if left_x < right_x {
+            left_x..right_x
+        } else {
+            right_x..left_x
+        }
+    })
+}
+
+fn merge_fragment(fragments: &mut SmallVec<[Range<Pixels>; 4]>, fragment: Range<Pixels>) {
+    if let Some(existing) = fragments
+        .iter_mut()
+        .find(|existing| existing.start <= fragment.end && fragment.start <= existing.end)
+    {
+        if fragment.start < existing.start {
+            existing.start = fragment.start;
+        }
+        if fragment.end > existing.end {
+            existing.end = fragment.end;
+        }
+    } else {
+        fragments.push(fragment);
     }
 }
 
@@ -982,6 +1205,127 @@ mod tests {
                 glyphs,
             }],
             len: 0,
+            bidi: None,
+        }
+    }
+
+    fn make_bidi_layout(caret_offsets: Vec<CaretOffset>) -> LineLayout {
+        LineLayout {
+            font_size: px(16.),
+            width: px(40.),
+            ascent: px(12.),
+            descent: px(4.),
+            runs: vec![ShapedRun {
+                font_id: FontId(0),
+                glyphs: vec![
+                    glyph_at(30., 0),
+                    glyph_at(20., 1),
+                    glyph_at(10., 2),
+                    glyph_at(0., 3),
+                ],
+            }],
+            len: 4,
+            bidi: Some(BidiLineLayout {
+                caret_offsets,
+                hit_test_ranges: vec![
+                    HitTestRange {
+                        start_x: px(0.),
+                        end_x: px(10.),
+                        index: 4,
+                    },
+                    HitTestRange {
+                        start_x: px(10.),
+                        end_x: px(20.),
+                        index: 3,
+                    },
+                    HitTestRange {
+                        start_x: px(20.),
+                        end_x: px(30.),
+                        index: 2,
+                    },
+                    HitTestRange {
+                        start_x: px(30.),
+                        end_x: px(40.),
+                        index: 1,
+                    },
+                ],
+            }),
+        }
+    }
+
+    fn make_mixed_bidi_layout() -> LineLayout {
+        LineLayout {
+            font_size: px(16.),
+            width: px(100.),
+            ascent: px(12.),
+            descent: px(4.),
+            runs: vec![ShapedRun {
+                font_id: FontId(0),
+                glyphs: (0..10)
+                    .map(|index| glyph_at(index as f32 * 10., index))
+                    .collect(),
+            }],
+            len: 10,
+            bidi: Some(BidiLineLayout {
+                caret_offsets: vec![
+                    CaretOffset {
+                        index: 0,
+                        primary_x: px(0.),
+                        secondary_x: None,
+                    },
+                    CaretOffset {
+                        index: 1,
+                        primary_x: px(10.),
+                        secondary_x: None,
+                    },
+                    CaretOffset {
+                        index: 2,
+                        primary_x: px(20.),
+                        secondary_x: None,
+                    },
+                    CaretOffset {
+                        index: 3,
+                        primary_x: px(70.),
+                        secondary_x: Some(px(30.)),
+                    },
+                    CaretOffset {
+                        index: 4,
+                        primary_x: px(60.),
+                        secondary_x: None,
+                    },
+                    CaretOffset {
+                        index: 5,
+                        primary_x: px(50.),
+                        secondary_x: None,
+                    },
+                    CaretOffset {
+                        index: 6,
+                        primary_x: px(40.),
+                        secondary_x: None,
+                    },
+                    CaretOffset {
+                        index: 7,
+                        primary_x: px(30.),
+                        secondary_x: Some(px(70.)),
+                    },
+                    CaretOffset {
+                        index: 8,
+                        primary_x: px(80.),
+                        secondary_x: None,
+                    },
+                    CaretOffset {
+                        index: 9,
+                        primary_x: px(90.),
+                        secondary_x: None,
+                    },
+                    CaretOffset {
+                        index: 10,
+                        primary_x: px(100.),
+                        secondary_x: None,
+                    },
+                ],
+                hit_test_ranges: Vec::new(),
+            }),
         }
     }
 
@@ -991,6 +1335,87 @@ mod tests {
             .iter()
             .map(|g| f32::from(g.position.x))
             .collect()
+    }
+
+    #[test]
+    fn test_bidi_caret_positions_do_not_assume_increasing_x() {
+        let layout = make_bidi_layout(vec![
+            CaretOffset {
+                index: 0,
+                primary_x: px(40.),
+                secondary_x: None,
+            },
+            CaretOffset {
+                index: 1,
+                primary_x: px(30.),
+                secondary_x: None,
+            },
+            CaretOffset {
+                index: 2,
+                primary_x: px(20.),
+                secondary_x: None,
+            },
+            CaretOffset {
+                index: 3,
+                primary_x: px(10.),
+                secondary_x: None,
+            },
+            CaretOffset {
+                index: 4,
+                primary_x: px(0.),
+                secondary_x: None,
+            },
+        ]);
+
+        assert_eq!(layout.x_for_index(0), px(40.));
+        assert_eq!(layout.x_for_index(1), px(30.));
+        assert_eq!(layout.x_for_index(4), px(0.));
+        assert_eq!(layout.index_for_x(px(5.)), Some(4));
+        assert_eq!(layout.index_for_x(px(35.)), Some(1));
+    }
+
+    #[test]
+    fn test_bidi_selection_fragments_are_normalized() {
+        let layout = make_bidi_layout(vec![
+            CaretOffset {
+                index: 0,
+                primary_x: px(40.),
+                secondary_x: None,
+            },
+            CaretOffset {
+                index: 1,
+                primary_x: px(30.),
+                secondary_x: None,
+            },
+            CaretOffset {
+                index: 2,
+                primary_x: px(20.),
+                secondary_x: None,
+            },
+            CaretOffset {
+                index: 3,
+                primary_x: px(10.),
+                secondary_x: None,
+            },
+        ]);
+
+        let fragments = layout.selection_fragments_for_range(1..3);
+        assert_eq!(fragments.len(), 1);
+        assert_eq!(fragments[0], px(10.)..px(30.));
+    }
+
+    #[test]
+    fn test_mixed_bidi_selection_fragments_use_local_boundary_affinity() {
+        let layout = make_mixed_bidi_layout();
+
+        let fragments = layout.selection_fragments_for_range(2..4);
+        assert_eq!(fragments.as_slice(), &[px(20.)..px(30.), px(60.)..px(70.)]);
+
+        let fragments = layout.selection_fragments_for_range(3..7);
+        assert_eq!(fragments.as_slice(), &[px(30.)..px(70.)]);
+
+        let fragments = layout.selection_fragments_for_range(6..8);
+        assert_eq!(fragments.as_slice(), &[px(30.)..px(40.), px(70.)..px(80.)]);
     }
 
     #[test]

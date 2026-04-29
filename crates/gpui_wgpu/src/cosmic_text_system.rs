@@ -255,10 +255,10 @@ impl CosmicTextSystemState {
                         continue;
                     };
                     let db_id = self.loaded_fonts[fb_id.0].font.id();
-                    if let Some(face) = self.font_system.db().face(db_id)
-                        && let Some(family) = face.families.first()
-                    {
-                        chain.push((fb_id, SharedString::from(family.0.clone())));
+                    if let Some(face) = self.font_system.db().face(db_id) {
+                        if let Some(family) = face.families.first() {
+                            chain.push((fb_id, SharedString::from(family.0.clone())));
+                        }
                     }
                 }
                 Arc::from(chain)
@@ -559,6 +559,7 @@ impl CosmicTextSystemState {
                 descent: Pixels::ZERO,
                 runs: Vec::new(),
                 len: text.len(),
+                bidi: None,
             };
         };
 
@@ -615,6 +616,7 @@ impl CosmicTextSystemState {
             descent: layout.max_descent.into(),
             runs,
             len: text.len(),
+            bidi: None,
         }
     }
 }

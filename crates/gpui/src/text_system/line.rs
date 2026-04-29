@@ -75,6 +75,7 @@ impl ShapedLine {
             descent: layout.descent,
             runs: layout.runs.clone(),
             len,
+            bidi: None,
         });
         self
     }
@@ -230,6 +231,7 @@ impl ShapedLine {
                 descent: self.layout.descent,
                 runs: left_runs,
                 len: byte_index,
+                bidi: None,
             }),
             text: left_text,
             decoration_runs: left_decorations,
@@ -243,6 +245,7 @@ impl ShapedLine {
                 descent: self.layout.descent,
                 runs: right_runs,
                 len: self.layout.len - byte_index,
+                bidi: None,
             }),
             text: right_text,
             decoration_runs: right_decorations,
@@ -783,6 +786,7 @@ mod tests {
                     glyphs: shaped_glyphs,
                 }],
                 len: text.len(),
+                bidi: None,
             }),
             text: SharedString::new(text),
             decoration_runs: SmallVec::from(decorations.to_vec()),
@@ -901,6 +905,7 @@ mod tests {
                     },
                 ],
                 len: 6,
+                bidi: None,
             }),
             text: "abcdef".into(),
             decoration_runs: SmallVec::new(),
