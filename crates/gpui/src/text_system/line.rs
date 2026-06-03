@@ -62,13 +62,22 @@ impl ShapedLine {
             .runs
             .iter()
             .flat_map(|run| run.glyphs.iter().map(|glyph| glyph.index))
-            .is_sorted();
+            .is_sorted()
+            && self
+                .layout
+                .visual_text_segments
+                .iter()
+                .is_sorted_by(|left, right| {
+                    left.logical_range.start <= right.logical_range.start
+                        && left.logical_range.end <= right.logical_range.end
+                });
         ShapedLineCursor {
             line: self,
             unordered_remainder: (!byte_ordered).then(|| self.clone()),
             byte_index: 0,
             run_index: 0,
             glyph_index: 0,
+            visual_text_segment_index: 0,
             decoration_index: 0,
             decoration_offset: 0,
             x_offset: px(0.),
@@ -99,6 +108,7 @@ impl ShapedLine {
             ascent: layout.ascent,
             descent: layout.descent,
             runs: layout.runs.clone(),
+            visual_text_segments: layout.visual_text_segments.clone(),
             len,
         });
         self
@@ -269,6 +279,7 @@ pub struct ShapedLineCursor<'a> {
     byte_index: usize,
     run_index: usize,
     glyph_index: usize,
+    visual_text_segment_index: usize,
     decoration_index: usize,
     decoration_offset: u32,
     x_offset: Pixels,
@@ -359,6 +370,15 @@ impl<'a> ShapedLineCursor<'a> {
         }
         self.byte_index = byte_index;
         self.x_offset = next_x;
+        while self
+            .line
+            .layout
+            .visual_text_segments
+            .get(self.visual_text_segment_index)
+            .is_some_and(|segment| segment.logical_range.start < previous_index)
+        {
+            self.visual_text_segment_index += 1;
+        }
         ShapedLine {
             layout: Arc::new(LineLayout {
                 font_size: self.line.layout.font_size,
@@ -366,6 +386,22 @@ impl<'a> ShapedLineCursor<'a> {
                 ascent: self.line.layout.ascent,
                 descent: self.line.layout.descent,
                 runs,
+                visual_text_segments: self
+                    .line
+                    .layout
+                    .visual_text_segments
+                    .iter()
+                    .skip(self.visual_text_segment_index)
+                    .take_while(|segment| segment.logical_range.end <= byte_index)
+                    .map(|segment| {
+                        let mut segment = segment.clone();
+                        segment.logical_range = segment.logical_range.start - previous_index
+                            ..segment.logical_range.end - previous_index;
+                        segment.x_range =
+                            segment.x_range.start - previous_x..segment.x_range.end - previous_x;
+                        segment
+                    })
+                    .collect(),
                 len: byte_index - previous_index,
             }),
             text: SharedString::new(&self.line.text[previous_index..byte_index]),
@@ -1011,7 +1047,8 @@ mod tests {
     use super::*;
     use crate::{
         AppContext as _, Context, FontId, GlyphId, IntoElement, Render, ShapedGlyph, ShapedRun,
-        Styled, TestAppContext, TextRun, Underline, canvas, font, hsla,
+        Styled, TestAppContext, TextDirection, TextRun, Underline, VisualTextSegment, canvas, font,
+        hsla,
     };
     use std::rc::Rc;
 
@@ -1033,16 +1070,21 @@ mod tests {
             })
             .collect();
 
+        let runs = vec![ShapedRun {
+            font_id: FontId(0),
+            glyphs: shaped_glyphs,
+        }];
+        let visual_text_segments =
+            LineLayout::default_visual_text_segments(&runs, text.len(), px(width));
+
         ShapedLine {
             layout: Arc::new(LineLayout {
                 font_size: px(16.0),
                 width: px(width),
                 ascent: px(12.0),
                 descent: px(4.0),
-                runs: vec![ShapedRun {
-                    font_id: FontId(0),
-                    glyphs: shaped_glyphs,
-                }],
+                runs,
+                visual_text_segments,
                 len: text.len(),
             }),
             text: SharedString::new(text),
@@ -1533,6 +1575,38 @@ mod tests {
                         ],
                     },
                 ],
+                visual_text_segments: vec![
+                    VisualTextSegment {
+                        logical_range: 0..1,
+                        x_range: px(0.0)..px(10.0),
+                        direction: TextDirection::LeftToRight,
+                    },
+                    VisualTextSegment {
+                        logical_range: 1..2,
+                        x_range: px(10.0)..px(20.0),
+                        direction: TextDirection::LeftToRight,
+                    },
+                    VisualTextSegment {
+                        logical_range: 2..3,
+                        x_range: px(20.0)..px(30.0),
+                        direction: TextDirection::LeftToRight,
+                    },
+                    VisualTextSegment {
+                        logical_range: 3..4,
+                        x_range: px(30.0)..px(40.0),
+                        direction: TextDirection::LeftToRight,
+                    },
+                    VisualTextSegment {
+                        logical_range: 4..5,
+                        x_range: px(40.0)..px(50.0),
+                        direction: TextDirection::LeftToRight,
+                    },
+                    VisualTextSegment {
+                        logical_range: 5..6,
+                        x_range: px(50.0)..px(60.0),
+                        direction: TextDirection::LeftToRight,
+                    },
+                ],
                 len: 6,
             }),
             text: "abcdef".into(),
@@ -1699,12 +1773,15 @@ mod tests {
             glyph.position.x = width;
             width += advance;
         }
+        let visual_text_segments =
+            LineLayout::default_visual_text_segments(&runs, layout.len, width);
         line.layout = Arc::new(LineLayout {
             font_size: layout.font_size,
             width,
             ascent: layout.ascent,
             descent: layout.descent,
             runs,
+            visual_text_segments,
             len: layout.len,
         });
         line
@@ -1773,6 +1850,19 @@ mod tests {
                         ],
                     },
                 ],
+                visual_text_segments: [
+                    (0..1, 0.0..17.0),
+                    (1..5, 17.0..25.0),
+                    (5..7, 25.0..41.0),
+                    (7..10, 41.0..50.0),
+                ]
+                .into_iter()
+                .map(|(logical_range, x_range)| VisualTextSegment {
+                    logical_range,
+                    x_range: px(x_range.start)..px(x_range.end),
+                    direction: TextDirection::LeftToRight,
+                })
+                .collect(),
                 len: 10,
             }),
             text: "a😀bcdef".into(),
@@ -1812,7 +1902,26 @@ mod tests {
 
     #[test]
     fn test_cursor_preserves_existing_visual_order_splitting() {
-        let line = make_shaped_line("abc", &[(0, 0.0), (2, 10.0), (1, 20.0)], 30.0, &[]);
+        let mut line = make_shaped_line("abc", &[(0, 0.0), (2, 10.0), (1, 20.0)], 30.0, &[]);
+        Arc::get_mut(&mut line.layout)
+            .expect("newly created layout should be uniquely owned")
+            .visual_text_segments = vec![
+            VisualTextSegment {
+                logical_range: 0..1,
+                x_range: px(0.0)..px(10.0),
+                direction: TextDirection::LeftToRight,
+            },
+            VisualTextSegment {
+                logical_range: 2..3,
+                x_range: px(10.0)..px(20.0),
+                direction: TextDirection::RightToLeft,
+            },
+            VisualTextSegment {
+                logical_range: 1..2,
+                x_range: px(20.0)..px(30.0),
+                direction: TextDirection::RightToLeft,
+            },
+        ];
         let mut cursor = line.cursor();
         let mut remainder = line.clone();
         let mut previous_boundary = 0;
@@ -1821,6 +1930,7 @@ mod tests {
             let actual = cursor.take_until(boundary);
             assert_eq!(actual.text, expected.text);
             assert_eq!(actual.width(), expected.width());
+            assert_eq!(actual.visual_text_segments, expected.visual_text_segments);
             assert_eq!(actual.runs.len(), expected.runs.len());
             for (actual, expected) in actual.runs.iter().zip(&expected.runs) {
                 assert_eq!(actual.font_id, expected.font_id);
@@ -1905,6 +2015,7 @@ mod tests {
                     assert_eq!(actual.text, expected.text);
                     assert_eq!(actual.len(), expected.len());
                     assert_eq!(actual.width(), expected.width());
+                    assert_eq!(actual.visual_text_segments, expected.visual_text_segments);
                     assert_eq!(actual.runs.len(), expected.runs.len());
                     for (actual, expected) in actual.runs.iter().zip(&expected.runs) {
                         assert_eq!(actual.font_id, expected.font_id);

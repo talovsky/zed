@@ -678,6 +678,15 @@ impl CosmicTextSystemState {
             }
         }
 
+        layout
+            .visual_text_segments
+            .extend(segment.visual_text_segments.into_iter().map(|mut segment| {
+                segment.logical_range = segment.logical_range.start + range.start
+                    ..segment.logical_range.end + range.start;
+                segment.x_range =
+                    segment.x_range.start + layout.width..segment.x_range.end + layout.width;
+                segment
+            }));
         layout.width += segment.width;
         layout.ascent = layout.ascent.max(segment.ascent);
         layout.descent = layout.descent.max(segment.descent);
@@ -765,6 +774,7 @@ impl CosmicTextSystemState {
                 ascent: Pixels::ZERO,
                 descent: Pixels::ZERO,
                 runs: Vec::new(),
+                visual_text_segments: Vec::new(),
                 len: text.len(),
             };
         };
@@ -831,12 +841,16 @@ impl CosmicTextSystemState {
             sink.report(missing_glyphs);
         }
 
+        let visual_text_segments =
+            LineLayout::default_visual_text_segments(&runs, text.len(), layout.w.into());
+
         LineLayout {
             font_size,
             width: layout.w.into(),
             ascent: layout.max_ascent.into(),
             descent: layout.max_descent.into(),
             runs,
+            visual_text_segments,
             len: text.len(),
         }
     }
@@ -1473,6 +1487,22 @@ mod tests {
         // Every segment contributes width, so the whole line is wider than its
         // leading paragraph alone.
         assert!(layout.width > layout_text(&text_system, "ab")?.width);
+        let mut expected_segments = Vec::new();
+        let mut byte_offset = 0;
+        let mut x_offset = Pixels::ZERO;
+        for text in ["ab", "\u{001c}", "cd", "\u{2029}", "ef"] {
+            let paragraph = layout_text(&text_system, text)?;
+            for mut segment in paragraph.visual_text_segments {
+                segment.logical_range = segment.logical_range.start + byte_offset
+                    ..segment.logical_range.end + byte_offset;
+                segment.x_range = segment.x_range.start + x_offset..segment.x_range.end + x_offset;
+                expected_segments.push(segment);
+            }
+            byte_offset += text.len();
+            x_offset += paragraph.width;
+        }
+        assert!(!expected_segments.is_empty());
+        assert_eq!(layout.visual_text_segments, expected_segments);
         Ok(())
     }
 
