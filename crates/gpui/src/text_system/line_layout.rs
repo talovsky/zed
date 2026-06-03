@@ -24,8 +24,30 @@ pub struct LineLayout {
     pub descent: Pixels,
     /// The shaped runs that make up this line
     pub runs: Vec<ShapedRun>,
+    /// Visual text segments used for logical/visual mapping.
+    pub visual_text_segments: Vec<VisualTextSegment>,
     /// The length of the line in utf-8 bytes
     pub len: usize,
+}
+
+/// Resolved text direction for a visual text segment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextDirection {
+    /// Left-to-right visual progression.
+    LeftToRight,
+    /// Right-to-left visual progression.
+    RightToLeft,
+}
+
+/// A visually contiguous span of shaped text.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VisualTextSegment {
+    /// UTF-8 byte range within the shaped line.
+    pub logical_range: Range<usize>,
+    /// X range occupied by this segment in visual order.
+    pub x_range: Range<Pixels>,
+    /// Resolved direction for caret affinity and logical/visual mapping.
+    pub direction: TextDirection,
 }
 
 /// A run of text that has been shaped .
@@ -59,58 +81,96 @@ impl LineLayout {
         if x >= self.width {
             None
         } else {
-            for run in self.runs.iter().rev() {
-                for glyph in run.glyphs.iter().rev() {
-                    if glyph.position.x <= x {
-                        return Some(glyph.index);
-                    }
-                }
-            }
-            Some(0)
+            Some(self.closest_index_for_x(x))
         }
     }
 
     /// closest_index_for_x returns the character boundary closest to the given x coordinate
     /// (e.g. to handle aligning up/down arrow keys)
     pub fn closest_index_for_x(&self, x: Pixels) -> usize {
-        let mut prev_index = 0;
-        let mut prev_x = px(0.);
+        let mut closest_index = 0;
+        let mut closest_distance = Pixels::MAX;
 
-        for run in self.runs.iter() {
-            for glyph in run.glyphs.iter() {
-                if glyph.position.x >= x {
-                    if glyph.position.x - x < x - prev_x {
-                        return glyph.index;
-                    } else {
-                        return prev_index;
-                    }
-                }
-                prev_index = glyph.index;
-                prev_x = glyph.position.x;
+        for (index, boundary_x, _) in self.index_positions() {
+            let distance = (boundary_x - x).abs();
+            if distance < closest_distance {
+                closest_index = index;
+                closest_distance = distance;
             }
         }
 
-        if self.len == 1 {
-            if x > self.width / 2. {
-                return 1;
-            } else {
-                return 0;
-            }
-        }
-
-        self.len
+        closest_index
     }
 
     /// The x position of the character at the given index
     pub fn x_for_index(&self, index: usize) -> Pixels {
-        for run in &self.runs {
-            for glyph in &run.glyphs {
-                if glyph.index >= index {
-                    return glyph.position.x;
+        let positions = self.index_positions();
+        let mut candidates = positions
+            .iter()
+            .filter(|(boundary_index, _, _)| *boundary_index == index)
+            .collect::<Vec<_>>();
+        if let Some((_, boundary_x, _)) = candidates
+            .iter()
+            .find(|(_, _, direction)| *direction == TextDirection::LeftToRight)
+        {
+            return *boundary_x;
+        }
+        if let Some((_, boundary_x, _)) = candidates.pop() {
+            return *boundary_x;
+        }
+
+        let mut last_position_before_index = Pixels::ZERO;
+        for (boundary_index, boundary_x, _) in positions {
+            if boundary_index > index {
+                return boundary_x;
+            }
+            last_position_before_index = boundary_x;
+        }
+
+        last_position_before_index
+    }
+
+    /// The visual x ranges covered by a logical byte range.
+    pub fn x_ranges_for_range(&self, range: Range<usize>) -> Vec<Range<Pixels>> {
+        if range.is_empty() {
+            return Vec::new();
+        }
+
+        let mut ranges = Vec::new();
+        let mut current_range: Option<Range<Pixels>> = None;
+
+        for segment in self.visual_text_segments_in_visual_order() {
+            if segment.logical_range.start >= range.end || segment.logical_range.end <= range.start
+            {
+                if let Some(current_range) = current_range.take() {
+                    ranges.push(current_range);
                 }
+                continue;
+            }
+
+            let start_x = segment.x_range.start.min(segment.x_range.end);
+            let end_x = segment.x_range.start.max(segment.x_range.end);
+            if start_x == end_x {
+                continue;
+            }
+
+            if let Some(current_range) = current_range.as_mut()
+                && start_x <= current_range.end
+            {
+                current_range.end = current_range.end.max(end_x);
+                continue;
+            }
+
+            if let Some(current_range) = current_range.replace(start_x..end_x) {
+                ranges.push(current_range);
             }
         }
-        self.width
+
+        if let Some(current_range) = current_range {
+            ranges.push(current_range);
+        }
+
+        ranges
     }
 
     /// The corresponding Font at the given index
@@ -123,6 +183,85 @@ impl LineLayout {
             }
         }
         None
+    }
+
+    fn index_positions(&self) -> Vec<(usize, Pixels, TextDirection)> {
+        if self.visual_text_segments.is_empty() {
+            return vec![
+                (0, Pixels::ZERO, TextDirection::LeftToRight),
+                (self.len, self.width, TextDirection::LeftToRight),
+            ];
+        }
+
+        let mut positions = Vec::with_capacity(self.visual_text_segments.len() * 2);
+        for segment in &self.visual_text_segments {
+            if segment.direction == TextDirection::RightToLeft {
+                positions.push((
+                    segment.logical_range.start,
+                    segment.x_range.end,
+                    segment.direction,
+                ));
+                positions.push((
+                    segment.logical_range.end,
+                    segment.x_range.start,
+                    segment.direction,
+                ));
+            } else {
+                positions.push((
+                    segment.logical_range.start,
+                    segment.x_range.start,
+                    segment.direction,
+                ));
+                positions.push((
+                    segment.logical_range.end,
+                    segment.x_range.end,
+                    segment.direction,
+                ));
+            }
+        }
+
+        positions.sort_by_key(|(index, _, _)| *index);
+        positions
+    }
+
+    fn visual_text_segments_in_visual_order(&self) -> Vec<&VisualTextSegment> {
+        let mut segments = self.visual_text_segments.iter().collect::<Vec<_>>();
+        segments.sort_by(|left, right| {
+            left.x_range
+                .start
+                .partial_cmp(&right.x_range.start)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        segments
+    }
+
+    /// Builds left-to-right visual text segments from glyph positions.
+    pub fn default_visual_text_segments(
+        runs: &[ShapedRun],
+        len: usize,
+        width: Pixels,
+    ) -> Vec<VisualTextSegment> {
+        let glyphs = runs
+            .iter()
+            .flat_map(|run| run.glyphs.iter())
+            .collect::<Vec<_>>();
+        glyphs
+            .iter()
+            .enumerate()
+            .map(|(ix, glyph)| {
+                let logical_end = glyphs
+                    .get(ix + 1)
+                    .map_or(len, |next_glyph| next_glyph.index);
+                let end_x = glyphs
+                    .get(ix + 1)
+                    .map_or(width, |next_glyph| next_glyph.position.x);
+                VisualTextSegment {
+                    logical_range: glyph.index..logical_end,
+                    x_range: glyph.position.x..end_x,
+                    direction: TextDirection::LeftToRight,
+                }
+            })
+            .collect()
     }
 
     fn compute_wrap_boundaries(
@@ -807,6 +946,9 @@ fn apply_force_width_to_layout(layout: &mut LineLayout, force_width: Pixels) {
             }
         }
     }
+
+    layout.visual_text_segments =
+        LineLayout::default_visual_text_segments(&layout.runs, layout.len, layout.width);
 }
 
 /// A run of text with a single font.
@@ -972,16 +1114,39 @@ mod tests {
     }
 
     fn make_layout(glyphs: Vec<ShapedGlyph>) -> LineLayout {
+        make_layout_with_len(glyphs, 0)
+    }
+
+    fn make_layout_with_len(glyphs: Vec<ShapedGlyph>, len: usize) -> LineLayout {
+        let runs = vec![ShapedRun {
+            font_id: FontId(0),
+            glyphs,
+        }];
+        let visual_text_segments = LineLayout::default_visual_text_segments(&runs, len, px(100.));
         LineLayout {
             font_size: px(16.),
             width: px(100.),
             ascent: px(12.),
             descent: px(4.),
-            runs: vec![ShapedRun {
-                font_id: FontId(0),
-                glyphs,
-            }],
-            len: 0,
+            runs,
+            visual_text_segments,
+            len,
+        }
+    }
+
+    fn make_layout_with_segments(
+        segments: Vec<VisualTextSegment>,
+        len: usize,
+        width: Pixels,
+    ) -> LineLayout {
+        LineLayout {
+            font_size: px(16.),
+            width,
+            ascent: px(12.),
+            descent: px(4.),
+            runs: Vec::new(),
+            visual_text_segments: segments,
+            len,
         }
     }
 
@@ -1074,5 +1239,250 @@ mod tests {
 
         let positions = glyph_x_positions(&layout);
         assert_eq!(positions, vec![0.5, 0.5]);
+    }
+
+    #[test]
+    fn test_x_for_index_ltr_glyph_order() {
+        let layout = make_layout_with_segments(
+            vec![
+                VisualTextSegment {
+                    logical_range: 0..1,
+                    x_range: px(0.)..px(8.),
+                    direction: TextDirection::LeftToRight,
+                },
+                VisualTextSegment {
+                    logical_range: 1..2,
+                    x_range: px(8.)..px(16.),
+                    direction: TextDirection::LeftToRight,
+                },
+                VisualTextSegment {
+                    logical_range: 2..3,
+                    x_range: px(16.)..px(24.),
+                    direction: TextDirection::LeftToRight,
+                },
+            ],
+            3,
+            px(24.),
+        );
+
+        assert_eq!(layout.x_for_index(0), px(0.));
+        assert_eq!(layout.x_for_index(1), px(8.));
+        assert_eq!(layout.x_for_index(2), px(16.));
+        assert_eq!(layout.x_for_index(3), px(24.));
+    }
+
+    #[test]
+    fn test_x_for_index_rtl_glyph_order() {
+        let layout = make_layout_with_segments(
+            vec![
+                VisualTextSegment {
+                    logical_range: 4..6,
+                    x_range: px(0.)..px(8.),
+                    direction: TextDirection::RightToLeft,
+                },
+                VisualTextSegment {
+                    logical_range: 2..4,
+                    x_range: px(8.)..px(16.),
+                    direction: TextDirection::RightToLeft,
+                },
+                VisualTextSegment {
+                    logical_range: 0..2,
+                    x_range: px(16.)..px(24.),
+                    direction: TextDirection::RightToLeft,
+                },
+            ],
+            6,
+            px(24.),
+        );
+
+        assert_eq!(layout.x_for_index(0), px(24.));
+        assert_eq!(layout.x_for_index(2), px(16.));
+        assert_eq!(layout.x_for_index(4), px(8.));
+        assert_eq!(layout.x_for_index(6), px(0.));
+    }
+
+    #[test]
+    fn test_closest_index_for_x_rtl_glyph_order() {
+        let layout = make_layout_with_segments(
+            vec![
+                VisualTextSegment {
+                    logical_range: 4..6,
+                    x_range: px(0.)..px(8.),
+                    direction: TextDirection::RightToLeft,
+                },
+                VisualTextSegment {
+                    logical_range: 2..4,
+                    x_range: px(8.)..px(16.),
+                    direction: TextDirection::RightToLeft,
+                },
+                VisualTextSegment {
+                    logical_range: 0..2,
+                    x_range: px(16.)..px(24.),
+                    direction: TextDirection::RightToLeft,
+                },
+            ],
+            6,
+            px(24.),
+        );
+
+        assert_eq!(layout.closest_index_for_x(px(1.)), 6);
+        assert_eq!(layout.closest_index_for_x(px(7.)), 4);
+        assert_eq!(layout.closest_index_for_x(px(15.)), 2);
+        assert_eq!(layout.closest_index_for_x(px(23.)), 0);
+    }
+
+    #[test]
+    fn test_x_for_index_mixed_ltr_and_rtl_glyph_order() {
+        let layout = make_layout_with_segments(
+            vec![
+                VisualTextSegment {
+                    logical_range: 0..1,
+                    x_range: px(0.)..px(8.),
+                    direction: TextDirection::LeftToRight,
+                },
+                VisualTextSegment {
+                    logical_range: 1..2,
+                    x_range: px(8.)..px(16.),
+                    direction: TextDirection::LeftToRight,
+                },
+                VisualTextSegment {
+                    logical_range: 4..6,
+                    x_range: px(16.)..px(24.),
+                    direction: TextDirection::RightToLeft,
+                },
+                VisualTextSegment {
+                    logical_range: 2..4,
+                    x_range: px(24.)..px(32.),
+                    direction: TextDirection::RightToLeft,
+                },
+                VisualTextSegment {
+                    logical_range: 6..7,
+                    x_range: px(32.)..px(40.),
+                    direction: TextDirection::LeftToRight,
+                },
+            ],
+            7,
+            px(40.),
+        );
+
+        assert_eq!(layout.x_for_index(0), px(0.));
+        assert_eq!(layout.x_for_index(1), px(8.));
+        assert_eq!(layout.x_for_index(2), px(16.));
+        assert_eq!(layout.x_for_index(4), px(24.));
+        assert_eq!(layout.x_for_index(6), px(32.));
+        assert_eq!(layout.x_for_index(7), px(40.));
+    }
+
+    #[test]
+    fn test_x_ranges_for_range_ltr_glyph_order() {
+        let layout = make_layout_with_segments(
+            vec![
+                VisualTextSegment {
+                    logical_range: 0..1,
+                    x_range: px(0.)..px(8.),
+                    direction: TextDirection::LeftToRight,
+                },
+                VisualTextSegment {
+                    logical_range: 1..2,
+                    x_range: px(8.)..px(16.),
+                    direction: TextDirection::LeftToRight,
+                },
+                VisualTextSegment {
+                    logical_range: 2..3,
+                    x_range: px(16.)..px(24.),
+                    direction: TextDirection::LeftToRight,
+                },
+            ],
+            3,
+            px(24.),
+        );
+
+        assert_eq!(layout.x_ranges_for_range(0..3), vec![px(0.)..px(24.)]);
+        assert_eq!(layout.x_ranges_for_range(1..3), vec![px(8.)..px(24.)]);
+    }
+
+    #[test]
+    fn test_x_ranges_for_range_rtl_glyph_order() {
+        let layout = make_layout_with_segments(
+            vec![
+                VisualTextSegment {
+                    logical_range: 4..6,
+                    x_range: px(0.)..px(8.),
+                    direction: TextDirection::RightToLeft,
+                },
+                VisualTextSegment {
+                    logical_range: 2..4,
+                    x_range: px(8.)..px(16.),
+                    direction: TextDirection::RightToLeft,
+                },
+                VisualTextSegment {
+                    logical_range: 0..2,
+                    x_range: px(16.)..px(24.),
+                    direction: TextDirection::RightToLeft,
+                },
+            ],
+            6,
+            px(24.),
+        );
+
+        assert_eq!(layout.x_ranges_for_range(0..6), vec![px(0.)..px(24.)]);
+        assert_eq!(layout.x_ranges_for_range(2..6), vec![px(0.)..px(16.)]);
+    }
+
+    #[test]
+    fn test_x_ranges_for_range_mixed_glyph_order_splits_around_ltr_island() {
+        let layout = make_layout_with_segments(
+            vec![
+                VisualTextSegment {
+                    logical_range: 6..8,
+                    x_range: px(0.)..px(8.),
+                    direction: TextDirection::RightToLeft,
+                },
+                VisualTextSegment {
+                    logical_range: 4..6,
+                    x_range: px(8.)..px(16.),
+                    direction: TextDirection::RightToLeft,
+                },
+                VisualTextSegment {
+                    logical_range: 2..4,
+                    x_range: px(16.)..px(24.),
+                    direction: TextDirection::RightToLeft,
+                },
+                VisualTextSegment {
+                    logical_range: 8..9,
+                    x_range: px(24.)..px(32.),
+                    direction: TextDirection::LeftToRight,
+                },
+                VisualTextSegment {
+                    logical_range: 9..10,
+                    x_range: px(32.)..px(40.),
+                    direction: TextDirection::LeftToRight,
+                },
+                VisualTextSegment {
+                    logical_range: 14..16,
+                    x_range: px(40.)..px(48.),
+                    direction: TextDirection::RightToLeft,
+                },
+                VisualTextSegment {
+                    logical_range: 12..14,
+                    x_range: px(48.)..px(56.),
+                    direction: TextDirection::RightToLeft,
+                },
+                VisualTextSegment {
+                    logical_range: 10..12,
+                    x_range: px(56.)..px(64.),
+                    direction: TextDirection::RightToLeft,
+                },
+            ],
+            16,
+            px(64.),
+        );
+
+        assert_eq!(layout.x_ranges_for_range(0..16), vec![px(0.)..px(64.)]);
+        assert_eq!(
+            layout.x_ranges_for_range(4..14),
+            vec![px(0.)..px(16.), px(24.)..px(40.), px(48.)..px(64.)]
+        );
+        assert_eq!(layout.x_ranges_for_range(8..10), vec![px(24.)..px(40.)]);
     }
 }

@@ -6269,7 +6269,75 @@ impl EditorElement {
                     .collect(),
             };
 
-            highlighted_range.paint(fill, layout.position_map.text_hitbox.bounds, window);
+            let visual_lines = row_range
+                .iter_rows()
+                .map(|row| {
+                    let line_layout =
+                        &layout.position_map.line_layouts[row.minus(start_row) as usize];
+                    let alignment_offset =
+                        line_layout.alignment_offset(layout.text_align, layout.content_width);
+                    let line_start_column = if row == range.start.row() {
+                        range.start.column() as usize
+                    } else {
+                        0
+                    };
+                    let line_end_column = if row == range.end.row() {
+                        range.end.column() as usize
+                    } else {
+                        line_layout.len
+                    };
+
+                    if line_start_column == 0 && line_end_column >= line_layout.len {
+                        vec![HighlightedRangeLine {
+                            start_x: layout.content_origin.x + alignment_offset
+                                - Pixels::from(layout.position_map.scroll_pixel_position.x),
+                            end_x: Pixels::from(
+                                ScrollPixelOffset::from(
+                                    layout.content_origin.x
+                                        + line_layout.width
+                                        + alignment_offset
+                                        + line_end_overshoot,
+                                ) - layout.position_map.scroll_pixel_position.x,
+                            ),
+                        }]
+                    } else {
+                        line_layout
+                            .x_ranges_for_range(line_start_column..line_end_column)
+                            .into_iter()
+                            .map(|range| HighlightedRangeLine {
+                                start_x: layout.content_origin.x
+                                    + Pixels::from(
+                                        ScrollPixelOffset::from(range.start + alignment_offset)
+                                            - layout.position_map.scroll_pixel_position.x,
+                                    ),
+                                end_x: layout.content_origin.x
+                                    + Pixels::from(
+                                        ScrollPixelOffset::from(range.end + alignment_offset)
+                                            - layout.position_map.scroll_pixel_position.x,
+                                    ),
+                            })
+                            .collect::<Vec<_>>()
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            for (row_offset, lines) in visual_lines.into_iter().enumerate() {
+                for line in lines {
+                    HighlightedRange {
+                        color,
+                        line_height: layout.position_map.line_height,
+                        corner_radius,
+                        start_y: highlighted_range.start_y
+                            + row_offset as f32 * layout.position_map.line_height,
+                        lines: vec![line],
+                    }
+                    .paint(
+                        fill,
+                        layout.position_map.text_hitbox.bounds,
+                        window,
+                    );
+                }
+            }
         }
     }
 
@@ -7702,6 +7770,50 @@ impl LineWithInvisibles {
         }
 
         fragment_start_x
+    }
+
+    pub fn x_ranges_for_range(&self, range: Range<usize>) -> Vec<Range<Pixels>> {
+        if range.is_empty() {
+            return Vec::new();
+        }
+
+        let mut ranges = Vec::new();
+        let mut fragment_start_x = Pixels::ZERO;
+        let mut fragment_start_index = 0;
+
+        for fragment in &self.fragments {
+            match fragment {
+                LineFragment::Text(shaped_line) => {
+                    let fragment_end_index = fragment_start_index + shaped_line.len;
+                    let start = range.start.max(fragment_start_index);
+                    let end = range.end.min(fragment_end_index);
+                    if start < end {
+                        ranges.extend(
+                            shaped_line
+                                .x_ranges_for_range(
+                                    start - fragment_start_index..end - fragment_start_index,
+                                )
+                                .into_iter()
+                                .map(|range| {
+                                    fragment_start_x + range.start..fragment_start_x + range.end
+                                }),
+                        );
+                    }
+                    fragment_start_x += shaped_line.width;
+                    fragment_start_index = fragment_end_index;
+                }
+                LineFragment::Element { len, size, .. } => {
+                    let fragment_end_index = fragment_start_index + len;
+                    if range.start < fragment_end_index && range.end > fragment_start_index {
+                        ranges.push(fragment_start_x..fragment_start_x + size.width);
+                    }
+                    fragment_start_x += size.width;
+                    fragment_start_index = fragment_end_index;
+                }
+            }
+        }
+
+        ranges
     }
 
     pub fn index_for_x(&self, x: Pixels) -> Option<usize> {
@@ -10493,19 +10605,33 @@ pub struct HighlightedRangeLine {
     pub end_x: Pixels,
 }
 
+impl HighlightedRangeLine {
+    fn normalized(&self) -> Self {
+        Self {
+            start_x: self.start_x.min(self.end_x),
+            end_x: self.start_x.max(self.end_x),
+        }
+    }
+}
+
 impl HighlightedRange {
     pub fn paint(&self, fill: bool, bounds: Bounds<Pixels>, window: &mut Window) {
-        if self.lines.len() >= 2 && self.lines[0].start_x > self.lines[1].end_x {
-            self.paint_lines(self.start_y, &self.lines[0..1], fill, bounds, window);
+        let lines = self
+            .lines
+            .iter()
+            .map(HighlightedRangeLine::normalized)
+            .collect::<Vec<_>>();
+        if lines.len() >= 2 && lines[0].start_x > lines[1].end_x {
+            self.paint_lines(self.start_y, &lines[0..1], fill, bounds, window);
             self.paint_lines(
                 self.start_y + self.line_height,
-                &self.lines[1..],
+                &lines[1..],
                 fill,
                 bounds,
                 window,
             );
         } else {
-            self.paint_lines(self.start_y, &self.lines, fill, bounds, window);
+            self.paint_lines(self.start_y, &lines, fill, bounds, window);
         }
     }
 

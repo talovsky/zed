@@ -1165,12 +1165,16 @@ impl PlatformTextSystem for NoopTextSystem {
             position = px(0.);
         }
 
+        let visual_text_segments =
+            LineLayout::default_visual_text_segments(&runs, text.len(), position);
+
         LineLayout {
             font_size,
             width: position,
             ascent: font_size * (metrics.ascent / metrics.units_per_em as f32),
             descent: font_size * (metrics.descent / metrics.units_per_em as f32),
             runs,
+            visual_text_segments,
             len: text.len(),
         }
     }
