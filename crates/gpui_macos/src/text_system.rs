@@ -8,6 +8,7 @@ use core_foundation::{
     number::CFNumber,
     string::CFString,
 };
+use core_foundation_sys::base::CFTypeRef;
 use core_graphics::{
     base::{CGGlyph, kCGImageAlphaPremultipliedLast},
     color_space::CGColorSpace,
@@ -22,7 +23,7 @@ use core_text::{
         kCTFontWidthTrait,
     },
     line::CTLine,
-    string_attributes::kCTFontAttributeName,
+    string_attributes::{kCTFontAttributeName, kCTParagraphStyleAttributeName},
 };
 use font_kit::{
     font::Font as FontKitFont,
@@ -37,7 +38,8 @@ use gpui::{
     Bounds, DevicePixels, Font, FontFallbacks, FontFeatures, FontId, FontMetrics, FontRun,
     FontStyle, FontWeight, GlyphId, Hsla, LineLayout, Pixels, PlatformTextSystem,
     RenderGlyphParams, Result, Rgba, SUBPIXEL_VARIANTS_X, ShapedGlyph, ShapedRun, SharedString,
-    Size, TextRenderingMode, point, px, size, swap_rgba_pa_to_bgra,
+    Size, TextDirection, TextRenderingMode, VisualTextSegment, point, px, size,
+    swap_rgba_pa_to_bgra,
 };
 use parking_lot::{RwLock, RwLockUpgradableReadGuard};
 use pathfinder_geometry::{
@@ -46,12 +48,15 @@ use pathfinder_geometry::{
     vector::Vector2F,
 };
 use smallvec::SmallVec;
-use std::{borrow::Cow, char, convert::TryFrom, sync::Arc, sync::OnceLock};
+use std::{borrow::Cow, char, convert::TryFrom, ffi::c_void, sync::Arc, sync::OnceLock};
 
 use crate::open_type::apply_features_and_fallbacks;
 
 #[allow(non_upper_case_globals)]
 const kCGImageAlphaOnly: u32 = 7;
+const CT_WRITING_DIRECTION_LEFT_TO_RIGHT: i8 = 0;
+const CT_PARAGRAPH_STYLE_SPECIFIER_BASE_WRITING_DIRECTION: u32 = 13;
+const CT_RUN_STATUS_RIGHT_TO_LEFT: u32 = 1 << 1;
 
 /// macOS text system using CoreText for font shaping.
 pub struct MacTextSystem(RwLock<MacTextSystemState>);
@@ -530,7 +535,6 @@ impl MacTextSystemState {
     }
 
     fn layout_line(&mut self, text: &str, font_size: Pixels, font_runs: &[FontRun]) -> LineLayout {
-        // Construct the attributed string, converting UTF8 ranges to UTF16 ranges.
         let mut string = CFMutableAttributedString::new();
         let mut max_ascent = 0.0f32;
         let mut max_descent = 0.0f32;
@@ -542,8 +546,7 @@ impl MacTextSystemState {
                 let text_run;
                 (text_run, text) = text.split_at(run.len);
 
-                let utf16_start = string.char_len(); // insert at end of string
-                // note: replace_str may silently ignore codepoints it dislikes (e.g., BOM at start of string)
+                let utf16_start = string.char_len();
                 string.replace_str(&CFString::new(text_run), CFRange::init(utf16_start, 0));
                 let utf16_end = string.char_len();
 
@@ -571,10 +574,22 @@ impl MacTextSystemState {
                 break_ligature = !break_ligature;
             }
         }
-        // Retrieve the glyphs from the shaped line, converting UTF16 offsets to UTF8 offsets.
+
+        if string.char_len() > 0 {
+            let paragraph_style = ltr_paragraph_style();
+            unsafe {
+                string.set_attribute(
+                    CFRange::init(0, string.char_len()),
+                    kCTParagraphStyleAttributeName,
+                    &paragraph_style,
+                );
+            }
+        }
+
         let line = CTLine::new_with_attributed_string(string.as_concrete_TypeRef());
         let glyph_runs = line.glyph_runs();
         let mut runs = <Vec<ShapedRun>>::with_capacity(glyph_runs.len() as usize);
+        let mut segment_starts = Vec::new();
         let mut ix_converter = StringIndexConverter::new(text);
         for run in glyph_runs.into_iter() {
             let attributes = run.attributes().unwrap();
@@ -596,33 +611,53 @@ impl MacTextSystemState {
                     &mut runs.last_mut().unwrap().glyphs
                 }
             };
-            for ((&glyph_id, position), &glyph_utf16_ix) in run
-                .glyphs()
-                .iter()
-                .zip(run.positions().iter())
-                .zip(run.string_indices().iter())
-            {
+            let glyph_ids = run.glyphs();
+            let positions = run.positions();
+            let string_indices = run.string_indices();
+            let direction = if run_direction_is_rtl(run.as_concrete_TypeRef()) {
+                TextDirection::RightToLeft
+            } else {
+                TextDirection::LeftToRight
+            };
+            let mut glyph_utf8_indices = Vec::with_capacity(string_indices.len());
+            for &glyph_utf16_ix in string_indices.iter() {
                 let glyph_utf16_ix = usize::try_from(glyph_utf16_ix).unwrap();
                 if ix_converter.utf16_ix > glyph_utf16_ix {
-                    // We cannot reuse current index converter, as it can only seek forward. Restart the search.
                     ix_converter = StringIndexConverter::new(text);
                 }
                 ix_converter.advance_to_utf16_ix(glyph_utf16_ix);
+                glyph_utf8_indices.push(ix_converter.utf8_ix);
+            }
+
+            for ((&glyph_id, position), &glyph_utf8_ix) in glyph_ids
+                .iter()
+                .zip(positions.iter())
+                .zip(glyph_utf8_indices.iter())
+            {
                 glyphs.push(ShapedGlyph {
                     id: GlyphId(glyph_id as u32),
                     position: point(position.x as f32, position.y as f32).map(px),
-                    index: ix_converter.utf8_ix,
+                    index: glyph_utf8_ix,
                     is_emoji: self.is_emoji(font_id),
                 });
             }
+
+            for (&glyph_utf8_ix, position) in glyph_utf8_indices.iter().zip(positions.iter()) {
+                segment_starts.push((glyph_utf8_ix, px(position.x as f32), direction));
+            }
         }
+
         let typographic_bounds = line.get_typographic_bounds();
+        let line_width = typographic_bounds.width.into();
+        let visual_text_segments =
+            visual_text_segments_from_starts(segment_starts, text.len(), line_width);
         LineLayout {
             runs,
             font_size,
             width: typographic_bounds.width.into(),
             ascent: max_ascent.into(),
             descent: max_descent.into(),
+            visual_text_segments,
             len: text.len(),
         }
     }
@@ -684,6 +719,89 @@ fn bounds_from_rect_i(rect: RectI) -> Bounds<DevicePixels> {
         origin: point(DevicePixels(rect.origin_x()), DevicePixels(rect.origin_y())),
         size: size(DevicePixels(rect.width()), DevicePixels(rect.height())),
     }
+}
+
+fn paragraph_style(direction: i8) -> CFType {
+    #[repr(C)]
+    struct CTParagraphStyleSetting {
+        spec: u32,
+        value_size: usize,
+        value: *const c_void,
+    }
+
+    unsafe extern "C" {
+        fn CTParagraphStyleCreate(
+            settings: *const CTParagraphStyleSetting,
+            setting_count: usize,
+        ) -> CFTypeRef;
+    }
+
+    let settings = [CTParagraphStyleSetting {
+        spec: CT_PARAGRAPH_STYLE_SPECIFIER_BASE_WRITING_DIRECTION,
+        value_size: std::mem::size_of_val(&direction),
+        value: (&direction as *const i8).cast(),
+    }];
+    let style = unsafe { CTParagraphStyleCreate(settings.as_ptr(), settings.len()) };
+    unsafe { CFType::wrap_under_create_rule(style) }
+}
+
+fn run_direction_is_rtl(run: core_text::run::CTRunRef) -> bool {
+    unsafe extern "C" {
+        fn CTRunGetStatus(run: core_text::run::CTRunRef) -> u32;
+    }
+
+    unsafe { CTRunGetStatus(run) & CT_RUN_STATUS_RIGHT_TO_LEFT != 0 }
+}
+
+fn visual_text_segments_from_starts(
+    segment_starts: Vec<(usize, Pixels, TextDirection)>,
+    text_len: usize,
+    line_width: Pixels,
+) -> Vec<VisualTextSegment> {
+    let mut logical_indices = segment_starts
+        .iter()
+        .map(|(logical_start, _, _)| *logical_start)
+        .collect::<Vec<_>>();
+    logical_indices.sort_unstable();
+    logical_indices.dedup();
+
+    let mut visual_starts = segment_starts
+        .iter()
+        .enumerate()
+        .map(|(ix, (_, x, _))| (ix, *x))
+        .collect::<Vec<_>>();
+    visual_starts.sort_by(|(_, left_x), (_, right_x)| {
+        left_x
+            .partial_cmp(right_x)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut visual_ends_by_segment = vec![line_width; segment_starts.len()];
+    for window in visual_starts.windows(2) {
+        let (segment_ix, _) = window[0];
+        let (_, next_x) = window[1];
+        visual_ends_by_segment[segment_ix] = next_x;
+    }
+
+    segment_starts
+        .into_iter()
+        .enumerate()
+        .map(|(ix, (logical_start, x, direction))| {
+            let logical_end = logical_indices
+                .iter()
+                .copied()
+                .find(|index| *index > logical_start)
+                .unwrap_or(text_len);
+            VisualTextSegment {
+                logical_range: logical_start..logical_end,
+                x_range: x..visual_ends_by_segment[ix],
+                direction,
+            }
+        })
+        .collect()
+}
+
+fn ltr_paragraph_style() -> CFType {
+    paragraph_style(CT_WRITING_DIRECTION_LEFT_TO_RIGHT)
 }
 
 // impl From<Vector2I> for Size<DevicePixels> {
@@ -768,6 +886,113 @@ mod lenient_font_attributes {
 mod tests {
     use crate::MacTextSystem;
     use gpui::{FontRun, GlyphId, PlatformTextSystem, font, px};
+
+    fn glyph_indices_by_x(layout: &gpui::LineLayout) -> Vec<usize> {
+        let mut glyphs = layout
+            .runs
+            .iter()
+            .flat_map(|run| run.glyphs.iter())
+            .collect::<Vec<_>>();
+        glyphs.sort_by(|left, right| {
+            left.position
+                .x
+                .partial_cmp(&right.position.x)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        glyphs.into_iter().map(|glyph| glyph.index).collect()
+    }
+
+    fn layout_with_runs(line: &str, run_lens: &[usize]) -> gpui::LineLayout {
+        let fonts = MacTextSystem::new();
+        let font_id = fonts
+            .font_id(&font("Arial"))
+            .expect("Arial should be available on macOS");
+        let font_runs = run_lens
+            .iter()
+            .copied()
+            .map(|len| FontRun { len, font_id })
+            .collect::<Vec<_>>();
+        fonts.layout_line(line, px(16.), &font_runs)
+    }
+
+    #[test]
+    fn leading_whitespace_stays_at_ltr_line_start_before_rtl_text() {
+        let fonts = MacTextSystem::new();
+        let font_id = fonts
+            .font_id(&font("Arial"))
+            .expect("Arial should be available on macOS");
+        let line = "\tשדךגת דשלגךשדךגת שדךגתדשךגת";
+        let layout = fonts.layout_line(
+            line,
+            px(16.),
+            &[FontRun {
+                len: line.len(),
+                font_id,
+            }],
+        );
+        let mut glyphs = layout.runs.iter().flat_map(|run| run.glyphs.iter());
+        let leading_whitespace_x = glyphs
+            .find(|glyph| glyph.index == 0)
+            .expect("leading tab should have a glyph")
+            .position
+            .x;
+        let first_text_x = layout
+            .runs
+            .iter()
+            .flat_map(|run| run.glyphs.iter())
+            .filter(|glyph| glyph.index > 0)
+            .map(|glyph| glyph.position.x)
+            .min_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))
+            .expect("rtl text should have glyphs");
+
+        assert!(leading_whitespace_x < first_text_x);
+    }
+
+    #[test]
+    fn hebrew_word_keeps_rtl_character_order() {
+        let line = "אב";
+        let layout = layout_with_runs(line, &[line.len()]);
+        assert_eq!(glyph_indices_by_x(&layout), vec![2, 0]);
+    }
+
+    #[test]
+    fn html_wrapped_hebrew_text_keeps_tags_outside_rtl_text() {
+        let line = "<span>הוספת מפלגה</span>";
+        let layout = layout_with_runs(line, &[line.len()]);
+        let closing_tag_start = line
+            .find("</span>")
+            .expect("line should have a closing tag");
+        let opening_tag_x = layout
+            .runs
+            .iter()
+            .flat_map(|run| run.glyphs.iter())
+            .find(|glyph| glyph.index == 0)
+            .expect("opening tag should have a glyph")
+            .position
+            .x;
+        let closing_tag_x = layout
+            .runs
+            .iter()
+            .flat_map(|run| run.glyphs.iter())
+            .find(|glyph| glyph.index == closing_tag_start)
+            .expect("closing tag should have a glyph")
+            .position
+            .x;
+        let hebrew_text_bounds = layout
+            .runs
+            .iter()
+            .flat_map(|run| run.glyphs.iter())
+            .filter(|glyph| ("<span>".len()..closing_tag_start).contains(&glyph.index))
+            .map(|glyph| glyph.position.x)
+            .fold(None, |bounds, x| match bounds {
+                None => Some((x, x)),
+                Some((min_x, max_x)) => Some((min_x.min(x), max_x.max(x))),
+            })
+            .expect("hebrew text should have glyphs");
+
+        assert!(opening_tag_x < hebrew_text_bounds.0);
+        assert!(closing_tag_x > hebrew_text_bounds.1);
+    }
 
     #[test]
     fn test_layout_line_bom_char() {

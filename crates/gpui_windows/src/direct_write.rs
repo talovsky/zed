@@ -623,12 +623,16 @@ impl DirectWriteState {
             )?;
             let width = px(renderer_context.width);
 
+            let visual_text_segments =
+                LineLayout::default_visual_text_segments(&runs, text.len(), width);
+
             Ok(LineLayout {
                 font_size,
                 width,
                 ascent,
                 descent,
                 runs,
+                visual_text_segments,
                 len: text.len(),
             })
         }

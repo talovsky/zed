@@ -695,6 +695,7 @@ impl CosmicTextSystemState {
                 ascent: Pixels::ZERO,
                 descent: Pixels::ZERO,
                 runs: Vec::new(),
+                visual_text_segments: Vec::new(),
                 len: text.len(),
             };
         };
@@ -745,12 +746,16 @@ impl CosmicTextSystemState {
             }
         }
 
+        let visual_text_segments =
+            LineLayout::default_visual_text_segments(&runs, text.len(), layout.w.into());
+
         LineLayout {
             font_size,
             width: layout.w.into(),
             ascent: layout.max_ascent.into(),
             descent: layout.max_descent.into(),
             runs,
+            visual_text_segments,
             len: text.len(),
         }
     }

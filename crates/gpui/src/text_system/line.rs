@@ -74,6 +74,7 @@ impl ShapedLine {
             ascent: layout.ascent,
             descent: layout.descent,
             runs: layout.runs.clone(),
+            visual_text_segments: layout.visual_text_segments.clone(),
             len,
         });
         self
@@ -762,7 +763,9 @@ fn aligned_origin_x(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{FontId, GlyphId, ShapedGlyph, ShapedRun};
+    use crate::{
+        FontId, GlyphId, ShapedGlyph, ShapedRun, TextDirection, VisualTextSegment,
+    };
 
     /// Helper: build a ShapedLine from glyph descriptors without the platform text system.
     /// Each glyph is described as (byte_index, x_position).
@@ -782,16 +785,21 @@ mod tests {
             })
             .collect();
 
+        let runs = vec![ShapedRun {
+            font_id: FontId(0),
+            glyphs: shaped_glyphs,
+        }];
+        let visual_text_segments =
+            LineLayout::default_visual_text_segments(&runs, text.len(), px(width));
+
         ShapedLine {
             layout: Arc::new(LineLayout {
                 font_size: px(16.0),
                 width: px(width),
                 ascent: px(12.0),
                 descent: px(4.0),
-                runs: vec![ShapedRun {
-                    font_id: FontId(0),
-                    glyphs: shaped_glyphs,
-                }],
+                runs,
+                visual_text_segments,
                 len: text.len(),
             }),
             text: SharedString::new(text),
@@ -908,6 +916,38 @@ mod tests {
                                 is_emoji: false,
                             },
                         ],
+                    },
+                ],
+                visual_text_segments: vec![
+                    VisualTextSegment {
+                        logical_range: 0..1,
+                        x_range: px(0.0)..px(10.0),
+                        direction: TextDirection::LeftToRight,
+                    },
+                    VisualTextSegment {
+                        logical_range: 1..2,
+                        x_range: px(10.0)..px(20.0),
+                        direction: TextDirection::LeftToRight,
+                    },
+                    VisualTextSegment {
+                        logical_range: 2..3,
+                        x_range: px(20.0)..px(30.0),
+                        direction: TextDirection::LeftToRight,
+                    },
+                    VisualTextSegment {
+                        logical_range: 3..4,
+                        x_range: px(30.0)..px(40.0),
+                        direction: TextDirection::LeftToRight,
+                    },
+                    VisualTextSegment {
+                        logical_range: 4..5,
+                        x_range: px(40.0)..px(50.0),
+                        direction: TextDirection::LeftToRight,
+                    },
+                    VisualTextSegment {
+                        logical_range: 5..6,
+                        x_range: px(50.0)..px(60.0),
+                        direction: TextDirection::LeftToRight,
                     },
                 ],
                 len: 6,
