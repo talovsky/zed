@@ -198,6 +198,8 @@ pub(crate) fn apply_replacements(layout: &mut LineLayout, replacements: Vec<Repl
         }
         destination_end = destination_start;
     }
+    layout.visual_text_segments =
+        LineLayout::default_visual_text_segments(&layout.runs, layout.len, layout.width);
 }
 
 #[cfg(test)]
@@ -378,9 +380,12 @@ mod tests {
                     glyphs,
                 }
             })
-            .collect();
+            .collect::<Vec<_>>();
+        let visual_text_segments =
+            LineLayout::default_visual_text_segments(&runs, index * 2, px(index as f32 * 10.0));
         LineLayout {
             runs,
+            visual_text_segments,
             width: px(index as f32 * 10.0),
             font_size: px(14.0),
             ascent: px(11.0),
@@ -507,6 +512,9 @@ mod tests {
         );
         assert_eq!(actual.runs[0].font_id, FontId(9));
         assert_eq!(actual.runs[0].glyphs.len(), 1);
+        assert_eq!(actual.visual_text_segments.len(), 1);
+        assert_eq!(actual.x_for_index(0), px(1.0));
+        assert_eq!(actual.x_ranges_for_range(0..16), vec![px(1.0)..px(60.0)]);
     }
 
     #[test]
