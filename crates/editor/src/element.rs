@@ -1211,13 +1211,27 @@ impl EditorElement {
                         [cursor_position.row().minus(visible_display_row_range.start) as usize];
                     let cursor_column = cursor_position.column() as usize;
 
-                    let cursor_character_x = cursor_row_layout.x_for_index(cursor_column)
-                        + cursor_row_layout
-                            .alignment_offset(self.style.text.text_align, text_hitbox.size.width);
-                    let cursor_next_x = cursor_row_layout.x_for_index(cursor_column + 1)
-                        + cursor_row_layout
-                            .alignment_offset(self.style.text.text_align, text_hitbox.size.width);
-                    let mut cell_width = cursor_next_x - cursor_character_x;
+                    let alignment_offset = cursor_row_layout
+                        .alignment_offset(self.style.text.text_align, text_hitbox.size.width);
+                    let cursor_grapheme = snapshot.grapheme_at(cursor_position);
+                    // Measure the character from its visual span: in RTL text the next logical
+                    // index lies to the left, and the caret x at a bidi boundary may sit at the
+                    // edge of a different run than the character itself.
+                    let cursor_character_x_range = cursor_grapheme.as_ref().and_then(|grapheme| {
+                        cursor_row_layout
+                            .x_ranges_for_range(cursor_column..cursor_column + grapheme.len())
+                            .into_iter()
+                            .next()
+                    });
+                    let mut cursor_character_x =
+                        cursor_row_layout.x_for_index(cursor_column) + alignment_offset;
+                    let mut cell_width = Pixels::ZERO;
+                    if let Some(x_range) = cursor_character_x_range {
+                        if selection.cursor_shape != CursorShape::Bar {
+                            cursor_character_x = x_range.start + alignment_offset;
+                        }
+                        cell_width = x_range.end - x_range.start;
+                    }
                     if cell_width == Pixels::ZERO {
                         cell_width = em_advance;
                     }
@@ -1231,7 +1245,7 @@ impl EditorElement {
 
                     if selection.cursor_shape == CursorShape::Block && !is_cursor_in_redacted_range
                     {
-                        if let Some(text) = snapshot.grapheme_at(cursor_position).or_else(|| {
+                        if let Some(text) = cursor_grapheme.or_else(|| {
                             if snapshot.is_empty() {
                                 snapshot.placeholder_text().and_then(|s| {
                                     s.graphemes(true).next().map(|s| s.to_string().into())
