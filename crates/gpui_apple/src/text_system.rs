@@ -60,7 +60,7 @@ use crate::open_type::apply_features_and_fallbacks;
 const kCGImageAlphaOnly: u32 = 7;
 const CT_WRITING_DIRECTION_LEFT_TO_RIGHT: i8 = 0;
 const CT_PARAGRAPH_STYLE_SPECIFIER_BASE_WRITING_DIRECTION: u32 = 13;
-const CT_RUN_STATUS_RIGHT_TO_LEFT: u32 = 1 << 1;
+const CT_RUN_STATUS_RIGHT_TO_LEFT: u32 = 1 << 0;
 
 /// Apple text system using CoreText for font shaping.
 pub struct AppleTextSystem(RwLock<AppleTextSystemState>);
@@ -899,7 +899,8 @@ mod lenient_font_attributes {
 mod tests {
     use crate::AppleTextSystem;
     use gpui::{
-        FontFallbacks, FontFeatures, FontId, FontRun, GlyphId, PlatformTextSystem, font, px,
+        FontFallbacks, FontFeatures, FontId, FontRun, GlyphId, PlatformTextSystem, TextDirection,
+        font, px,
     };
     use std::sync::Arc;
 
@@ -1151,6 +1152,29 @@ mod tests {
 
         assert!(opening_tag_x < hebrew_text_bounds.0);
         assert!(closing_tag_x > hebrew_text_bounds.1);
+    }
+
+    #[test]
+    fn hebrew_caret_positions_follow_rtl_segments() {
+        let line = "\tשלום";
+        let layout = layout_with_runs(line, &[line.len()]);
+        let segment_for = |logical_start: usize| {
+            layout
+                .visual_text_segments
+                .iter()
+                .find(|segment| segment.logical_range.start == logical_start)
+                .expect("each character should have a visual text segment")
+        };
+
+        assert_eq!(segment_for(0).direction, TextDirection::LeftToRight);
+        for logical_start in [1, 3, 5, 7] {
+            assert_eq!(
+                segment_for(logical_start).direction,
+                TextDirection::RightToLeft
+            );
+        }
+        assert_eq!(layout.x_for_index(3), segment_for(1).x_range.start);
+        assert_eq!(layout.x_for_index(5), segment_for(3).x_range.start);
     }
 
     #[test]
